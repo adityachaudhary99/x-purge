@@ -141,6 +141,43 @@ X-Purge does **not** collect, transmit, or store any of your data externally. Ev
 
 ---
 
+## Chrome Web Store
+
+### Build the submission package
+
+```bash
+bash build.sh
+# → creates x-purge-1.1.0.zip
+```
+
+### Store listing checklist
+
+| Item | Notes |
+|------|-------|
+| **Package** | Run `bash build.sh` — upload the resulting `.zip` |
+| **Short description** | ≤132 chars — already set in `manifest.json` |
+| **Detailed description** | Copy/adapt from this README |
+| **Category** | `Productivity` |
+| **Screenshots** | 1280×800 or 640×400 PNG — capture the panel on `x.com/following` |
+| **Store icon** | 128×128 PNG — `icons/icon128.png` |
+| **Privacy policy URL** | Host `PRIVACY_POLICY.md` publicly (e.g. GitHub Pages or a raw GitHub URL) and paste the URL in the "Privacy practices" tab |
+| **Permissions justification** | See table below |
+
+### Permissions justification (for CWS review form)
+
+| Permission | Justification |
+|-----------|---------------|
+| `storage` | Persists user filter settings, daily unfollow counter, and global whitelist locally on the user's device |
+| `tabs` | Reads the active tab URL to detect whether the user is on `x.com/following`, and navigates to that page from the popup |
+| `windows` | Focuses the X browser window when the user clicks "Open Following Page" from the popup |
+| `host_permissions: x.com, twitter.com` | Injects the content scripts and makes direct API calls to X's own endpoints using the user's existing authenticated session — equivalent to normal browser requests |
+
+### Single-purpose declaration
+
+> X-Purge has a single purpose: helping users manage their X (Twitter) following list by applying filters and performing unfollows. It does not collect data, display ads, or perform any action outside of `x.com` and `twitter.com`.
+
+---
+
 ## License
 
 [MIT](LICENSE)
