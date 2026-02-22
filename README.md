@@ -53,7 +53,7 @@ Manages all persistent state (daily counter, whitelist, filter settings) via `ch
 
 1. **Clone or download** this repository:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/x-purge.git
+   git clone https://github.com/adityachaudhary99/x-purge.git
    ```
 
 2. Open Chrome and navigate to `chrome://extensions`
@@ -134,7 +134,7 @@ Contributions are welcome. Please open an issue before starting work on a signif
 |-----------|-----------------|
 | `storage` | Persist daily counter, whitelist, and filter settings |
 | `tabs` | Detect active tab URL to show/hide the popup button |
-| `scripting` | Reserved for future programmatic injection |
+| `windows` | Focus the X browser window when opening from the popup |
 | `host_permissions: x.com, twitter.com` | Content scripts and direct API calls to X's endpoints |
 
 X-Purge does **not** collect, transmit, or store any of your data externally. Everything stays in your browser.
