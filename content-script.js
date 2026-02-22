@@ -64,6 +64,7 @@
       minDelay: 5,
       maxDelay: 15,
       batchSize: 10,
+      scanLimit: 250,              // 0 = scan all
     };
   }
 
@@ -72,7 +73,14 @@
   // ============================================================
   const SW = {
     send(msg) {
-      return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
+      return new Promise((resolve) => {
+        try {
+          chrome.runtime.sendMessage(msg, (res) => {
+            if (chrome.runtime.lastError) resolve(null); // stale context — graceful fallback
+            else resolve(res);
+          });
+        } catch { resolve(null); } // context fully invalidated
+      });
     },
     getDailyCount: () => SW.send({ type: 'GET_DAILY_COUNT' }),
     incrementDaily: () => SW.send({ type: 'INCREMENT_DAILY_COUNT' }),
@@ -166,79 +174,199 @@
   };
 
   // ============================================================
-  // PROFILE FETCHER — lightweight async fetch for extra data
-  // Results cached in sessionStorage to avoid re-fetching.
+  // API INTERCEPTOR — receives data relayed from page-bridge.js
+  // page-bridge.js patches window.fetch in the MAIN world and
+  // postMessages every GraphQL "Following" response back here.
+  // Also receives API_CREDENTIALS (queryId, features, authorization)
+  // from the first organic Following request so we can make direct
+  // API calls for scanning and unfollowing without DOM scrolling.
   // ============================================================
-  const Fetcher = {
-    cache: new Map(),
+  const APIInterceptor = {
+    _listeners: new Set(),
+    _auth:   null,  // full scan credentials: { queryId, features, userId, authorization }
+    _bearer: null,  // just the Bearer token — available earlier, used for direct unfollow
 
-    async fetchProfile(username) {
-      if (this.cache.has(username)) return this.cache.get(username);
+    // Subscribe a callback; called each time a batch of users arrives
+    subscribe(fn) { this._listeners.add(fn); },
+    unsubscribe(fn) { this._listeners.delete(fn); },
 
+    // Parse a GraphQL Following response into our account objects
+    parseResponse(json) {
+      const accounts = [];
       try {
-        const res = await fetch(`https://x.com/${username}`, { credentials: 'include' });
-        const html = await res.text();
-        const data = this._parse(html, username);
-        this.cache.set(username, data);
-        return data;
-      } catch {
-        return null;
+        // Walk the timeline instructions to find user entries
+        const instructions =
+          json?.data?.user?.result?.timeline_v2?.timeline?.instructions ??
+          json?.data?.user?.result?.timeline?.timeline?.instructions ?? [];
+
+        for (const instr of instructions) {
+          if (instr.type !== 'TimelineAddEntries' && instr.type !== 'TimelineAddToModule') continue;
+          const entries = instr.entries ?? instr.moduleItems ?? [];
+          for (const entry of entries) {
+            const item = entry?.content?.itemContent ?? entry?.item?.itemContent;
+            const userResult = item?.user_results?.result;
+            if (!userResult) continue;
+            const acc = this._fromUserResult(userResult);
+            if (acc) accounts.push(acc);
+          }
+        }
+      } catch (e) {
+        console.warn('[X-Purge] GraphQL parse error:', e);
       }
+      return accounts;
     },
 
-    _parse(html, username) {
-      // Extract __NEXT_DATA__ JSON embedded in the page
-      const match = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-      if (!match) return this._parseMeta(html);
+    _fromUserResult(result) {
+      const legacy = result?.legacy;
+      // X moved screen_name / name / created_at from legacy → result.core
+      const core = result?.core;
+      const screenName = core?.screen_name ?? legacy?.screen_name;
+      if (!screenName) return null;
 
-      try {
-        const json = JSON.parse(match[1]);
-        // Traverse to user entity
-        const user = this._findUser(json, username);
-        if (!user) return null;
+      const now = Date.now();
+      // created_at is now in core; keep legacy fallback for older API versions
+      const created = (core?.created_at || legacy?.created_at)
+        ? new Date(core?.created_at ?? legacy?.created_at) : null;
+      // X's Following endpoint rarely includes the latest tweet.
+      // Fall back to statuses_count === 0 → treat as never tweeted (infinite inactivity).
+      const lastTweet = legacy?.status?.created_at ? new Date(legacy.status.created_at) : null;
+      const neverTweeted = !lastTweet && legacy?.statuses_count === 0;
 
-        const created = user.created_at ? new Date(user.created_at) : null;
-        const now = new Date();
-        const accountAgeMonths = created
-          ? Math.floor((now - created) / (1000 * 60 * 60 * 24 * 30))
-          : null;
+      // followed_by moved to result.relationship_perspectives in newer API
+      const relPersp = result?.relationship_perspectives;
+      const isFollowingBack = relPersp?.followed_by ?? legacy?.followed_by ?? null;
 
-        return {
-          followers: user.followers_count ?? null,
-          following: user.friends_count ?? null,
-          isFollowingBack: user.followed_by ?? null,
-          accountAgeMonths,
-          daysSinceLastPost: this._daysSince(user.status?.created_at),
-        };
-      } catch {
-        return this._parseMeta(html);
-      }
+      return {
+        username: screenName.toLowerCase(),
+        restId: result.rest_id ?? null,  // Twitter user ID — used for direct API unfollow
+        displayName: core?.name ?? legacy?.name ?? '',
+        bio: legacy?.description ?? '',
+        isVerified: !!(legacy?.verified || result.is_blue_verified),
+        hasDefaultAvatar: !!legacy?.default_profile_image,
+        reason: null,
+        element: null,   // resolved later from DOM when unfollowing
+        profileData: {
+          followers:       legacy?.followers_count ?? null,
+          following:       legacy?.friends_count   ?? null,
+          isFollowingBack,
+          accountAgeMonths: created
+            ? Math.floor((now - created) / (1000 * 60 * 60 * 24 * 30))
+            : null,
+          // 9999 = never tweeted; null = we simply don't know
+          daysSinceLastPost: lastTweet
+            ? Math.floor((now - lastTweet) / (1000 * 60 * 60 * 24))
+            : neverTweeted ? 9999 : null,
+        },
+      };
+    },
+  };
+
+  // ============================================================
+  // DIRECT FETCHER — uses captured auth to hit X's API without scrolling
+  // ============================================================
+  const DirectFetcher = {
+    _ct0() {
+      return document.cookie.match(/(?:^|;\s*)ct0=([A-Za-z0-9]+)/)?.[1] ?? null;
     },
 
-    _findUser(obj, username) {
-      if (obj && typeof obj === 'object') {
-        if (obj.screen_name?.toLowerCase() === username) return obj;
-        for (const v of Object.values(obj)) {
-          const found = this._findUser(v, username);
-          if (found) return found;
+    // Fetch one page of the Following list.
+    // cursor = null → first page; pass the Bottom cursor for subsequent pages.
+    async fetchFollowingPage(cursor) {
+      const auth = APIInterceptor._auth;
+      const ct0  = this._ct0();
+      if (!auth?.queryId || !auth?.userId || !ct0) return null;
+
+      const vars = { userId: auth.userId, count: 200, includePromotedContent: false };
+      if (cursor) vars.cursor = cursor;
+
+      const url = `https://x.com/i/api/graphql/${auth.queryId}/Following` +
+        `?variables=${encodeURIComponent(JSON.stringify(vars))}` +
+        (auth.features ? `&features=${encodeURIComponent(auth.features)}` : '');
+
+      try {
+        const resp = await fetch(url, {
+          headers: {
+            'Authorization':          auth.authorization,
+            'X-Csrf-Token':           ct0,
+            'X-Twitter-Active-User':  'yes',
+            'X-Twitter-Auth-Type':    'OAuth2Session',
+          },
+          credentials: 'include',
+        });
+        if (!resp.ok) { console.warn('[X-Purge] DirectFetcher HTTP', resp.status); return null; }
+        return resp.json();
+      } catch (e) { console.warn('[X-Purge] DirectFetcher error:', e); return null; }
+    },
+
+    // Extract the "Bottom" cursor from a GraphQL response for the next page.
+    extractCursor(json) {
+      const instructions =
+        json?.data?.user?.result?.timeline_v2?.timeline?.instructions ??
+        json?.data?.user?.result?.timeline?.timeline?.instructions ?? [];
+      for (const instr of instructions) {
+        for (const entry of (instr.entries ?? [])) {
+          const c = entry.content;
+          if (c?.cursorType === 'Bottom') return c.value;
         }
       }
       return null;
     },
 
-    _parseMeta(html) {
-      // Fallback: extract follower count from og:description meta tag
-      // "X followers, Y following, Z Tweets"
-      const m = html.match(/(\d[\d,]*)\s+Followers/i);
-      return m ? { followers: parseInt(m[1].replace(/,/g, ''), 10), following: null, isFollowingBack: null, accountAgeMonths: null, daysSinceLastPost: null } : null;
-    },
-
-    _daysSince(dateStr) {
-      if (!dateStr) return null;
-      const d = new Date(dateStr);
-      return Math.floor((Date.now() - d) / (1000 * 60 * 60 * 24));
+    // Unfollow a user by their Twitter rest_id (numeric user ID).
+    // Only needs the Bearer token + ct0 cookie — no queryId/userId required.
+    // Returns true on success.
+    async unfollowUser(restId) {
+      const bearer = APIInterceptor._bearer || APIInterceptor._auth?.authorization;
+      const ct0    = this._ct0();
+      if (!restId || !ct0 || !bearer) return false;
+      try {
+        const resp = await fetch('https://x.com/i/api/1.1/friendships/destroy.json', {
+          method: 'POST',
+          headers: {
+            'Authorization':          bearer,
+            'X-Csrf-Token':           ct0,
+            'Content-Type':           'application/x-www-form-urlencoded',
+            'X-Twitter-Active-User':  'yes',
+            'X-Twitter-Auth-Type':    'OAuth2Session',
+          },
+          credentials: 'include',
+          body: `user_id=${restId}`,
+        });
+        return resp.ok;
+      } catch { return false; }
     },
   };
+
+  // Route postMessages from page-bridge.js → APIInterceptor
+  window.addEventListener('message', (event) => {
+    if (event.source !== window) return;
+    if (event.data?.__xpurge === 'FOLLOWING_PAGE') {
+      const accounts = APIInterceptor.parseResponse(event.data.json);
+      if (accounts.length) APIInterceptor._listeners.forEach(fn => fn(accounts));
+    }
+    // Bearer token alone — available early via Headers.prototype.set patching.
+    // Enough to unfollow via REST without needing the full scan credentials.
+    if (event.data?.__xpurge === 'BEARER_TOKEN') {
+      if (!APIInterceptor._bearer) {
+        APIInterceptor._bearer = event.data.authorization;
+      }
+    }
+    // Full scan credentials (queryId + userId + bearer) — needed for API scan.
+    if (event.data?.__xpurge === 'API_CREDENTIALS') {
+      try {
+        const { queryId, features, variables, authorization } = event.data;
+        const userId = variables ? JSON.parse(variables).userId : null;
+        APIInterceptor._auth   = { queryId, features, userId, authorization };
+        APIInterceptor._bearer = APIInterceptor._bearer || authorization;
+      } catch {}
+    }
+  });
+
+  // Pull any credentials the bridge already captured before this script loaded.
+  // page-bridge.js runs at document_start (MAIN world); we run at document_idle
+  // (ISOLATED world). The first organic Following request often fires before our
+  // message listener above is registered, so we ask the bridge to re-send.
+  window.postMessage({ __xpurge: 'REQUEST_CREDENTIALS' }, '*');
 
   // ============================================================
   // FILTER ENGINE
@@ -346,15 +474,59 @@
   // ============================================================
   const Engine = {
     async unfollowOne(acc) {
-      // Re-query button at execution time (DOM may have changed)
-      const cell = acc.element;
-      let btn = Scraper.findUnfollowBtn(cell, acc.username);
+      // ── Fast path: direct REST call — only needs restId + bearer + ct0 ────
+      const hasBearer = !!(APIInterceptor._bearer || APIInterceptor._auth?.authorization);
+      if (acc.restId && hasBearer) {
+        const ok = await DirectFetcher.unfollowUser(acc.restId);
+        if (ok) return true;
+        console.warn('[X-Purge] Direct API unfollow failed for', acc.username, '— falling back to DOM');
+      }
+
+      // ── Slow path: find DOM button and click ──────────────────────────────
+      // Used when restId is missing (DOM-only accounts) or API call failed.
+      // Use the same regex as Scraper.fromCell so hrefs like
+      // /username?referrer=following still match.
+      const findBtn = () => {
+        for (const cell of document.querySelectorAll(SEL.userCell)) {
+          const hasLink = Array.from(cell.querySelectorAll('a[href]')).some(a => {
+            const m = (a.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]{1,50})(?:[/?#].*)?$/);
+            return m && m[1].toLowerCase() === acc.username;
+          });
+          if (!hasLink) continue;
+          return Scraper.findUnfollowBtn(cell, acc.username);
+        }
+        return null;
+      };
+
+      let btn = findBtn();
       if (!btn) {
-        console.warn('[X-Purge] No unfollow button for', acc.username);
+        // X virtualises the Following list — the account cell may not be in the DOM.
+        // Scroll from the top in chunks until the cell appears.
+        // Use window.scrollY (not col.scrollTop) — X scrolls via window, col.scrollTop stays 0.
+        const col = document.querySelector('[data-testid="primaryColumn"]') ||
+                    document.querySelector('main');
+        window.scrollTo(0, 0);
+        if (col) col.scrollTo(0, 0);
+        await Safety.sleep(700);
+        let lastY = -1;
+        for (let i = 0; i < 40 && !btn; i++) {
+          btn = findBtn();
+          if (btn) break;
+          if (window.scrollY === lastY) break; // reached the bottom of the page
+          lastY = window.scrollY;
+          window.scrollBy(0, 1200);
+          if (col) col.scrollBy(0, 1200);
+          await Safety.sleep(500);
+        }
+      }
+      if (!btn) {
+        console.warn('[X-Purge] No unfollow button found for', acc.username);
         return false;
       }
 
       try {
+        btn.scrollIntoView({ block: 'center', behavior: 'instant' });
+        await Safety.sleep(150);
         btn.click(); // Opens "Unfollow?" modal
 
         // Wait for confirm dialog
@@ -389,7 +561,7 @@
     },
 
     async run(targets, filters, isDryRun, callbacks) {
-      const { onProgress, onDone } = callbacks;
+      const { onProgress, onDone, onEach } = callbacks;
       let unfollowed = 0;
       let batchCount = 0;
 
@@ -411,17 +583,12 @@
           unfollowed++;
           batchCount++;
           if (!isDryRun) await SW.incrementDaily();
+          if (onEach) onEach(acc, i); // notify UI to remove from list
         }
 
-        // Batch break every batchSize unfollows
-        if (batchCount > 0 && batchCount % filters.batchSize === 0 && i < targets.length - 1) {
-          const breakMs = isDryRun ? 300 : 15 * 60 * 1000;
-          onProgress({ action: `Batch break: resting 15min after ${batchCount}…`, unfollowed, total: targets.length });
-          await Safety.sleep(breakMs);
-        } else {
-          const delay = Safety.randomDelay(filters.minDelay, filters.maxDelay);
-          onProgress({ action: `Waiting ${(delay / 1000).toFixed(1)}s…`, unfollowed, total: targets.length, next: targets[i + 1]?.username });
-          await Safety.sleep(isDryRun ? 150 : delay);
+        // Brief pause every 10 unfollows to avoid rate-limiting (silent — no UI message).
+        if (i < targets.length - 1 && batchCount > 0 && batchCount % 10 === 0) {
+          await Safety.sleep(isDryRun ? 150 : Math.floor(1000 + Math.random() * 2000));
         }
       }
 
@@ -430,34 +597,7 @@
     },
   };
 
-  // ============================================================
-  // AUTO-SCROLL OBSERVER
-  // Appends a sentinel at bottom of timeline; fires callback
-  // whenever it enters the viewport (triggers X's lazy load).
-  // ============================================================
-  const ScrollObs = {
-    _obs: null,
-    _sentinel: null,
-
-    start(onVisible) {
-      const container = document.querySelector(SEL.primaryColumn) || document.querySelector('main');
-      if (!container) return;
-
-      this._sentinel = document.createElement('div');
-      this._sentinel.id = 'xpurge-sentinel';
-      container.appendChild(this._sentinel);
-
-      this._obs = new IntersectionObserver((entries) => {
-        if (entries[0].isIntersecting) onVisible();
-      }, { threshold: 0.1 });
-      this._obs.observe(this._sentinel);
-    },
-
-    stop() {
-      if (this._obs) { this._obs.disconnect(); this._obs = null; }
-      if (this._sentinel?.parentNode) { this._sentinel.remove(); this._sentinel = null; }
-    },
-  };
+  // (ScrollObs removed — scanning now driven by API interception)
 
   // ============================================================
   // SLIDER CHECKPOINTS
@@ -509,7 +649,22 @@
       labels: ['5', '10', '15', '20', '25', '30', '40', '50'],
       def: 1, // 10
     },
+    'f-scanLimit': {
+      values: [50, 100, 250, 500, 1000, 2000, 5000, 0],
+      labels: ['50', '100', '250', '500', '1K', '2K', '5K', 'All'],
+      def: 2, // 250
+    },
   };
+
+  function escHtml(s) {
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function fmtNum(n) {
+    if (n == null) return '?';
+    if (n >= 1e6) return (n/1e6).toFixed(1).replace(/\.0$/,'') + 'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1).replace(/\.0$/,'') + 'K';
+    return String(n);
+  }
 
   // Read the actual numeric value from a slider
   function sliderVal(id) {
@@ -598,6 +753,10 @@
     <button id="xpurge-close" title="Close">✕</button>
   </div>
 
+  <div id="filters-toggle" class="xp-collapse-hdr">
+    Filters <span id="filters-chevron" class="xp-chevron open">▾</span>
+  </div>
+
   <div id="xpurge-body">
 
     <!-- Relationship -->
@@ -640,6 +799,7 @@
     <!-- Safety -->
     <div class="xp-section">
       <div class="xp-section-title">Safety</div>
+      ${sl('f-scanLimit',  'Scan limit')}
       ${sl('f-dailyLimit', 'Daily limit')}
       ${sl('f-minDelay',   'Min delay')}
       ${sl('f-maxDelay',   'Max delay')}
@@ -660,16 +820,6 @@
       <div id="wl-list"></div>
     </div>
 
-    <!-- Action buttons -->
-    <div id="xpurge-actions">
-      <button id="btn-scan" class="xp-btn xp-btn-secondary">Dry Run / Scan</button>
-      <button id="btn-purge" class="xp-btn xp-btn-danger">Start Purge</button>
-    </div>
-
-    <div id="btn-stop-wrap" style="display:none">
-      <button id="btn-stop" class="xp-btn xp-btn-secondary">⏹ Stop</button>
-    </div>
-
   </div><!-- /body -->
 
   <!-- Progress bar -->
@@ -680,10 +830,25 @@
     <div id="prog-next"></div>
   </div>
 
-  <!-- Results -->
+  <!-- Results panel -->
   <div id="xpurge-results" style="display:none">
-    <div class="xp-section-title">Scan Results (<span id="result-count">0</span> targets)</div>
+    <div id="result-hdr">
+      <span id="result-count-label">0 accounts match filters</span>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+        <button id="btn-unfollow-all" class="xp-btn xp-btn-danger" style="display:none">Unfollow All</button>
+        <span id="results-chevron" class="xp-chevron open">▾</span>
+      </div>
+    </div>
     <ul id="result-list"></ul>
+  </div>
+
+  <!-- Action buttons (outside body so they stay visible when results are shown) -->
+  <div id="xpurge-actions">
+    <button id="btn-scan" class="xp-btn xp-btn-secondary">Scan</button>
+  </div>
+
+  <div id="btn-stop-wrap" style="display:none">
+    <button id="btn-stop" class="xp-btn xp-btn-secondary">⏹ Stop</button>
   </div>
 
 </div><!-- /inner -->
@@ -710,30 +875,72 @@
         this._renderWhitelist();
       });
 
-      // Scan (dry run)
+      // Scan — collects following list and shows results for manual review
       document.getElementById('btn-scan').addEventListener('click', () => this._startScan(true));
 
-      // Purge
-      document.getElementById('btn-purge').addEventListener('click', () => this._startScan(false));
+      // Filters collapse toggle
+      document.getElementById('filters-toggle').addEventListener('click', () => {
+        const body    = document.getElementById('xpurge-body');
+        const chevron = document.getElementById('filters-chevron');
+        const isOpen  = body.style.display !== 'none';
+        body.style.display = isOpen ? 'none' : 'block';
+        chevron.classList.toggle('open', !isOpen);
+      });
 
-      // Stop
+      // Results list collapse toggle (click header, but not the Unfollow All button)
+      document.getElementById('result-hdr').addEventListener('click', (e) => {
+        if (e.target.closest('#btn-unfollow-all')) return;
+        const list    = document.getElementById('result-list');
+        const chevron = document.getElementById('results-chevron');
+        const isOpen  = list.style.display !== 'none';
+        list.style.display = isOpen ? 'none' : 'block';
+        chevron.classList.toggle('open', !isOpen);
+      });
+
+      // Stop — during scan: stops scroll and shows results with what was collected so far
+      //         during purge: aborts the unfollow loop
       document.getElementById('btn-stop').addEventListener('click', () => {
-        state.running = false;
-        state.scanning = false;
-        this._updateAction('Stopped.');
+        if (state.scanning) {
+          state.scanning = false;
+          // _startScan will continue to the filter+results phase automatically
+        } else {
+          state.running = false;
+          this._finishUI('Stopped.');
+        }
       });
     },
 
     async _loadSaved() {
+      // chrome.runtime.id goes undefined when the extension is reloaded without
+      // refreshing the tab — detect this early and show a clear message.
+      if (!chrome.runtime?.id) {
+        this._showReloadBanner();
+        return;
+      }
       const saved = await SW.getFilters();
+      if (saved === null) { this._showReloadBanner(); return; } // context died mid-call
       if (saved) {
         state.filters = { ...state.filters, ...saved };
         this._fillForm(state.filters);
       }
-      state.whitelist = await SW.getWhitelist();
-      state.dailyCount = await SW.getDailyCount();
+      state.whitelist = (await SW.getWhitelist()) ?? [];
+      state.dailyCount = (await SW.getDailyCount()) ?? 0;
       this._renderWhitelist();
       this._updateHeat();
+    },
+
+    _showReloadBanner() {
+      const prog = document.getElementById('xpurge-progress');
+      const actions = document.getElementById('xpurge-actions');
+      if (prog) {
+        prog.style.display = 'block';
+        const el = document.getElementById('prog-action');
+        if (el) {
+          el.style.color = '#ef4444';
+          el.textContent = '⚠ Extension was reloaded — refresh this page (F5) to reconnect.';
+        }
+      }
+      if (actions) actions.style.display = 'none';
     },
 
     _fillForm(f) {
@@ -750,6 +957,7 @@
       setSlider('f-followerRatioBelow', f.followerRatioBelow);
       setSlider('f-minFollowerProtect', f.minFollowerProtect);
       setSlider('f-accountAgeMonths',   f.accountAgeMonths);
+      setSlider('f-scanLimit',          f.scanLimit);
       setSlider('f-dailyLimit',         f.dailyLimit);
       setSlider('f-minDelay',           f.minDelay);
       setSlider('f-maxDelay',           f.maxDelay);
@@ -776,6 +984,7 @@
         accountAgeMonths:    sliderVal('f-accountAgeMonths'),
         bioBlacklist:        kws('f-bioBlacklist'),
         bioWhitelist:        kws('f-bioWhitelist'),
+        scanLimit:           sliderVal('f-scanLimit'),         // 0 = no limit
         dailyLimit:          sliderVal('f-dailyLimit') || 50,
         minDelay:            sliderVal('f-minDelay')   || 5,
         maxDelay:            sliderVal('f-maxDelay')   || 15,
@@ -822,6 +1031,11 @@
     // ---- Scan / Purge flow ----
     async _startScan(dryRun) {
       if (state.running || state.scanning) return;
+      if (!chrome.runtime?.id) { this._showReloadBanner(); return; }
+
+      // Restore filter panel (may be hidden from a previous scan's results view)
+      document.getElementById('xpurge-body').style.display = 'block';
+      document.getElementById('filters-chevron')?.classList.add('open');
 
       state.filters = this._readForm();
 
@@ -845,40 +1059,277 @@
       document.getElementById('btn-stop-wrap').style.display = 'block';
       document.getElementById('xpurge-actions').style.display = 'none';
 
-      this._updateAction(dryRun ? 'Scanning (dry run)…' : 'Scanning before purge…');
+      this._updateAction('Scanning…');
 
-      // Phase 1: scroll and collect all accounts via MutationObserver
+      // Phase 1: scroll + scrape DOM cells; organic API calls triggered by
+      // scroll are intercepted by page-bridge.js and enrich account data.
       state.scanning = true;
       await this._scrollAndCollect();
+      // scanning may be false here (user stopped or limit hit) — either way,
+      // continue to filter + show results with what was collected
 
-      if (!state.scanning) return; // stopped
-
-      // Phase 2: deep-fetch profiles if needed
-      const needsFetch = state.filters.notFollowingBack || state.filters.inactiveDays > 0 ||
-        state.filters.followerRatioBelow > 0 || state.filters.minFollowerProtect > 0 ||
-        state.filters.accountAgeMonths > 0;
-
-      if (needsFetch) {
-        await this._deepFetchAll();
-      }
-
-      // Phase 3: apply filters
+      // Phase 2: apply filters
       state.targets = state.scanned.filter(acc => Filters.evaluate(acc, state.filters, state.whitelist));
 
-      this._showResults(state.targets);
+      const apiEnriched = state.scanned.filter(a => a.profileData).length;
+      this._showResults(state.targets, dryRun);
 
-      // Update progress stats to show scan summary
       const statsEl = document.getElementById('prog-stats');
-      if (statsEl) statsEl.textContent = `Scanned ${state.scanned.length} accounts — ${state.targets.length} match filters`;
+      if (statsEl) statsEl.textContent =
+        `Scanned ${state.scanned.length} · ${state.targets.length} match · ${apiEnriched} enriched`;
 
-      if (dryRun) {
-        this._finishUI(`Dry run complete: ${state.targets.length} of ${state.scanned.length} accounts would be unfollowed.`);
-        return;
+      this._finishUI(`Scanned ${state.scanned.length} — ${state.targets.length} match filters`);
+    },
+
+    // ── Fast path: direct GraphQL pagination, no DOM scrolling ──────────────
+    // Used when page-bridge.js has already captured auth credentials from the
+    // organic Following request that fires on page load.
+    async _scrollAndCollect() {
+      const scanLimit = state.filters.scanLimit > 0 ? state.filters.scanLimit : Infinity;
+
+      // Wait for auth credentials if not yet available.
+      // X fires the organic Following request as soon as the list renders;
+      // we give it up to 5s to arrive before falling back to DOM scroll.
+      if (!APIInterceptor._auth) {
+        this._updateAction('Waiting for API credentials…');
+        await new Promise(resolve => {
+          let elapsed = 0;
+          const poll = () => {
+            if (APIInterceptor._auth || elapsed >= 5000) { resolve(); return; }
+            elapsed += 200;
+            setTimeout(poll, 200);
+          };
+          poll();
+        });
       }
 
-      // Phase 4: execute unfollows
+      if (APIInterceptor._auth) {
+        await this._collectViaApi(scanLimit);
+      } else {
+        console.warn('[X-Purge] API credentials unavailable — falling back to DOM scroll');
+        await this._collectViaScroll(scanLimit);
+      }
+    },
+
+    async _collectViaApi(scanLimit) {
+      const seenUsernames = new Set();
+      let cursor = null;
+      let page = 0;
+
+      while (state.scanning && state.scanned.length < scanLimit) {
+        page++;
+        this._updateAction(`Scanning… ${state.scanned.length} accounts (API page ${page})`);
+        const json = await DirectFetcher.fetchFollowingPage(cursor);
+        if (!json) {
+          console.warn('[X-Purge] _collectViaApi: fetchFollowingPage returned null', { page, cursor });
+          break;
+        }
+
+        const accounts = APIInterceptor.parseResponse(json);
+        if (!accounts.length) break;
+
+        for (const acc of accounts) {
+          if (state.scanned.length >= scanLimit) break;
+          if (!seenUsernames.has(acc.username)) {
+            seenUsernames.add(acc.username);
+            state.scanned.push(acc);
+          }
+        }
+
+        cursor = DirectFetcher.extractCursor(json);
+        if (!cursor) break; // end of list
+        await Safety.sleep(300); // brief pause between pages to avoid rate-limits
+      }
+    },
+
+    // ── Fallback: organic scroll + DOM scrape ───────────────────────────────
+    // Keeps working if auth credentials haven't been captured yet.
+    // The first organic Following request also triggers API_CREDENTIALS relay
+    // so subsequent scans use the fast path above.
+    _scrollDown() {
+      window.scrollBy(0, 1400);
+      const col = document.querySelector('[data-testid="primaryColumn"]') ||
+                  document.querySelector('main');
+      if (col) col.scrollBy(0, 1400);
+    },
+
+    async _collectViaScroll(scanLimit) {
+      const seenUsernames = new Set();
+      const apiCache = new Map();
+
+      const enrichFrom = (scanned, apiAcc) => {
+        scanned.profileData = apiAcc.profileData;
+        if (apiAcc.restId)                               scanned.restId          = apiAcc.restId;
+        if (typeof apiAcc.hasDefaultAvatar === 'boolean') scanned.hasDefaultAvatar = apiAcc.hasDefaultAvatar;
+        if (typeof apiAcc.isVerified       === 'boolean') scanned.isVerified       = apiAcc.isVerified;
+        if (apiAcc.bio)         scanned.bio         = apiAcc.bio;
+        if (apiAcc.displayName) scanned.displayName = scanned.displayName || apiAcc.displayName;
+      };
+
+      const onBatch = (accounts) => {
+        for (const acc of accounts) { if (acc.username) apiCache.set(acc.username, acc); }
+        for (const scanned of state.scanned) {
+          const a = apiCache.get(scanned.username);
+          if (a) enrichFrom(scanned, a);
+        }
+      };
+      APIInterceptor.subscribe(onBatch);
+
+      const collectVisible = () => {
+        let found = 0;
+        for (const cell of document.querySelectorAll(SEL.userCell)) {
+          if (state.scanned.length >= scanLimit) break;
+          const acc = Scraper.fromCell(cell);
+          if (!acc.username || seenUsernames.has(acc.username)) continue;
+          seenUsernames.add(acc.username);
+          const apiAcc = apiCache.get(acc.username);
+          if (apiAcc) enrichFrom(acc, apiAcc);
+          state.scanned.push(acc);
+          found++;
+        }
+        return found;
+      };
+
+      collectVisible();
+
+      return new Promise((resolve) => {
+        let emptyRounds = 0;
+        const MAX_EMPTY = 4;
+
+        const doScroll = () => {
+          if (!state.scanning || state.scanned.length >= scanLimit) {
+            APIInterceptor.unsubscribe(onBatch); resolve(); return;
+          }
+          const countBefore = state.scanned.length;
+          this._scrollDown();
+
+          let fallbackTimer;
+          const root = document.querySelector('[data-testid="primaryColumn"]') || document.body;
+          const obs = new MutationObserver(() => {
+            if (collectVisible() > 0) {
+              clearTimeout(fallbackTimer); obs.disconnect();
+              emptyRounds = 0;
+              this._updateAction(`Scanning… ${state.scanned.length} accounts`);
+              setTimeout(doScroll, 350);
+            }
+          });
+          obs.observe(root, { childList: true, subtree: true });
+
+          fallbackTimer = setTimeout(() => {
+            obs.disconnect();
+            collectVisible();
+            if (state.scanned.length > countBefore) { emptyRounds = 0; } else { emptyRounds++; }
+            this._updateAction(`Scanning… ${state.scanned.length} accounts`);
+            if (emptyRounds >= MAX_EMPTY) { APIInterceptor.unsubscribe(onBatch); resolve(); }
+            else { doScroll(); }
+          }, 2000);
+        };
+
+        doScroll();
+      });
+    },
+
+    _showResults(targets, dryRun) {
+      const wrap        = document.getElementById('xpurge-results');
+      const list        = document.getElementById('result-list');
+      const countLabel  = document.getElementById('result-count-label');
+      const unfAllBtn   = document.getElementById('btn-unfollow-all');
+      wrap.style.display = 'block';
+      document.getElementById('xpurge-body').style.display = 'none';
+      document.getElementById('result-list').style.display = 'block';
+      // Sync chevrons: filters closed, results open
+      document.getElementById('filters-chevron')?.classList.remove('open');
+      document.getElementById('results-chevron')?.classList.add('open');
+
+      const updateHeader = () => {
+        countLabel.textContent = `${state.targets.length} accounts match filters`;
+        if (state.targets.length > 0) {
+          const remaining    = Math.max(0, state.filters.dailyLimit - state.dailyCount);
+          const willUnfollow = Math.min(state.targets.length, remaining);
+          unfAllBtn.textContent = `Unfollow All (${willUnfollow} under daily limit)`;
+          unfAllBtn.style.display = 'block';
+        } else {
+          unfAllBtn.style.display = 'none';
+        }
+      };
+
+      const renderList = () => {
+        if (!state.targets.length) {
+          list.innerHTML = '<li class="xp-hint" style="padding:8px 14px">No accounts match current filters</li>';
+          return;
+        }
+        list.innerHTML = state.targets.map((acc, idx) => {
+          const pd = acc.profileData;
+          const stats = [
+            pd?.followers != null ? `${fmtNum(pd.followers)} followers` : null,
+            pd?.accountAgeMonths != null ? `${pd.accountAgeMonths}mo old` : null,
+          ].filter(Boolean).join(' · ');
+          const bio = acc.bio
+            ? escHtml(acc.bio.slice(0, 65)) + (acc.bio.length > 65 ? '…' : '')
+            : '';
+          return `<li class="result-item" data-idx="${idx}">
+            <div class="ri-main">
+              <a class="ri-name" href="https://x.com/${acc.username}" target="_blank" rel="noopener noreferrer">@${acc.username}</a>
+              <span class="ri-reason">${acc.reason || ''}</span>
+              ${stats ? `<span class="ri-stats">${stats}</span>` : ''}
+              ${bio   ? `<span class="ri-bio">${bio}</span>` : ''}
+            </div>
+            <div class="ri-btns">
+              <button class="ri-skip-btn" data-idx="${idx}">Skip</button>
+              <button class="ri-unf-btn" data-idx="${idx}">Unfollow</button>
+            </div>
+          </li>`;
+        }).join('');
+
+        list.querySelectorAll('.ri-skip-btn').forEach(btn => {
+          btn.addEventListener('click', () => {
+            state.targets.splice(parseInt(btn.dataset.idx, 10), 1);
+            updateHeader();
+            renderList();
+          });
+        });
+
+        list.querySelectorAll('.ri-unf-btn').forEach(btn => {
+          btn.addEventListener('click', async () => {
+            const idx = parseInt(btn.dataset.idx, 10);
+            const acc = state.targets[idx];
+            btn.disabled = true;
+            btn.textContent = '…';
+            const daily = await SW.getDailyCount();
+            if (daily >= state.filters.dailyLimit) { btn.textContent = 'Limit!'; return; }
+            state.running = true;
+            const ok = await Engine.unfollowOne(acc);
+            state.running = false;
+            if (ok) {
+              await SW.incrementDaily();
+              state.dailyCount++;
+              state.targets.splice(idx, 1);
+              updateHeader();
+              renderList();
+            } else {
+              btn.disabled = false;
+              btn.textContent = 'Unfollow';
+            }
+          });
+        });
+      };
+
+      unfAllBtn.onclick = null;
+      unfAllBtn.addEventListener('click', () => this._runPurge());
+      updateHeader();
+      renderList();
+    },
+
+    async _runPurge() {
+      if (state.running || !state.targets.length) return;
+      const unfAllBtn = document.getElementById('btn-unfollow-all');
+      if (unfAllBtn) unfAllBtn.style.display = 'none';
+      document.getElementById('btn-stop-wrap').style.display = 'block';
+      document.getElementById('xpurge-actions').style.display = 'none';
+
+      const totalTargets = state.targets.length; // capture before any removal
+      const unfollowedUsernames = new Set();
       state.running = true;
-      state.scanning = false;
       await Engine.run(
         state.targets,
         state.filters,
@@ -888,111 +1339,31 @@
             this._updateAction(action);
             this._updateProgress(unfollowed, total, next);
           },
+          onEach: (acc, idx) => {
+            unfollowedUsernames.add(acc.username);
+            // Remove the item from the results list live
+            const li = document.querySelector(`#result-list li[data-idx="${idx}"]`);
+            if (li) li.remove();
+            // Update the header count
+            const remaining = state.targets.length - unfollowedUsernames.size;
+            const countLabel = document.getElementById('result-count-label');
+            if (countLabel) countLabel.textContent = `${remaining} accounts match filters`;
+          },
           onDone: (count) => {
+            // Sync progress bar to final accurate count
+            this._updateProgress(count, totalTargets, null);
+            // Prune successfully unfollowed accounts from state
+            state.targets = state.targets.filter(a => !unfollowedUsernames.has(a.username));
+            const unfAllBtn2 = document.getElementById('btn-unfollow-all');
+            if (unfAllBtn2) unfAllBtn2.style.display = 'none';
+            const list = document.getElementById('result-list');
+            if (list && state.targets.length === 0) {
+              list.innerHTML = '<li class="xp-hint" style="padding:8px 14px">All done — no more accounts match.</li>';
+            }
             this._finishUI(`Done! Unfollowed ${count} accounts today.`);
           },
         }
       );
-    },
-
-    async _scrollAndCollect() {
-      const seenUsernames = new Set();
-
-      // Harvest every currently visible UserCell that hasn't been processed yet
-      const harvest = () => {
-        let newFound = 0;
-        for (const cell of document.querySelectorAll(SEL.userCell)) {
-          if (cell._xpScanned) continue;
-          cell._xpScanned = true;
-          const acc = Scraper.fromCell(cell);
-          if (acc.username && !seenUsernames.has(acc.username)) {
-            seenUsernames.add(acc.username);
-            state.scanned.push(acc);
-            newFound++;
-          }
-        }
-        return newFound;
-      };
-
-      // Scroll both the window AND the inner container X uses
-      const scrollDown = () => {
-        const inner = document.querySelector('[data-testid="primaryColumn"]') ||
-                      document.querySelector('main');
-        window.scrollBy(0, 1200);
-        if (inner) inner.scrollTop += 1200;
-      };
-
-      return new Promise((resolve) => {
-        let noNewStreak = 0;
-        const MAX_EMPTY = 4; // 4 × 1.5s = 6s of no new accounts before stopping
-
-        // MutationObserver fires as soon as X appends new rows to the DOM
-        const mo = new MutationObserver(() => {
-          const n = harvest();
-          if (n > 0) {
-            noNewStreak = 0;
-            this._updateAction(`Scanning… ${state.scanned.length} accounts found`);
-          }
-        });
-        mo.observe(document.body, { childList: true, subtree: true });
-
-        const tick = () => {
-          if (!state.scanning) { mo.disconnect(); resolve(); return; }
-
-          const before = state.scanned.length;
-          harvest();
-          scrollDown();
-
-          setTimeout(() => {
-            if (!state.scanning) { mo.disconnect(); resolve(); return; }
-
-            if (state.scanned.length === before) {
-              noNewStreak++;
-            } else {
-              noNewStreak = 0;
-            }
-
-            this._updateAction(`Scanning… ${state.scanned.length} accounts found`);
-
-            if (noNewStreak >= MAX_EMPTY) {
-              mo.disconnect();
-              resolve();
-            } else {
-              tick();
-            }
-          }, 1500);
-        };
-
-        harvest(); // grab what's already on screen before first scroll
-        tick();
-      });
-    },
-
-    async _deepFetchAll() {
-      const total = state.scanned.length;
-      for (let i = 0; i < total; i++) {
-        if (!state.scanning) break;
-        const acc = state.scanned[i];
-        if (acc.username) {
-          this._updateAction(`Fetching profile ${i + 1}/${total}: @${acc.username}`);
-          acc.profileData = await Fetcher.fetchProfile(acc.username);
-          await Safety.sleep(400); // gentle pacing
-        }
-      }
-    },
-
-    _showResults(targets) {
-      const wrap = document.getElementById('xpurge-results');
-      const list = document.getElementById('result-list');
-      const count = document.getElementById('result-count');
-      wrap.style.display = 'block';
-      count.textContent = targets.length;
-      list.innerHTML = targets.slice(0, 50).map(acc =>
-        `<li class="result-item">
-          <span class="result-name">@${acc.username}</span>
-          <span class="result-reason">${acc.reason || ''}</span>
-        </li>`
-      ).join('') + (targets.length > 50 ? `<li class="xp-hint">…and ${targets.length - 50} more</li>` : '');
     },
 
     _updateAction(text) {
