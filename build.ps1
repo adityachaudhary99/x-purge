@@ -1,4 +1,4 @@
-# build.ps1 — packages X-Purge for Chrome Web Store submission
+# build.ps1 -- packages X-Purge for Chrome Web Store submission
 # Usage: .\build.ps1
 # Output: x-purge-<version>.zip in the current directory
 
@@ -12,8 +12,8 @@ $dist     = ".dist-tmp"
 Write-Host "Building X-Purge v$version..."
 
 # Clean up previous build artifacts
-if (Test-Path $dist)  { Remove-Item -Recurse -Force $dist }
-if (Test-Path $out)   { Remove-Item -Force $out }
+if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
+if (Test-Path $out)  { Remove-Item -Force $out }
 
 New-Item -ItemType Directory -Path "$dist\icons" | Out-Null
 
@@ -42,10 +42,10 @@ Compress-Archive -Path "$dist\*" -DestinationPath $out
 # Clean up temp directory
 Remove-Item -Recurse -Force $dist
 
-$size = (Get-Item $out).Length / 1KB
-Write-Host "✓  Created $out ($([math]::Round($size, 1)) KB)"
+$sizeKB = [math]::Round((Get-Item $out).Length / 1KB, 1)
+Write-Host "Done! Created $out ($sizeKB KB)"
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  1. Go to https://chrome.google.com/webstore/devconsole"
 Write-Host "  2. Click 'New item' and upload $out"
-Write-Host "  3. Fill in the store listing (see README.md § Chrome Web Store)"
+Write-Host "  3. Fill in the store listing (see README.md - Chrome Web Store section)"
