@@ -61,9 +61,6 @@
 
       // Safety
       dailyLimit: 50,
-      minDelay: 5,
-      maxDelay: 15,
-      batchSize: 10,
       scanLimit: 250,              // 0 = scan all
     };
   }
@@ -455,12 +452,6 @@
   const Safety = {
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 
-    randomDelay(minSec, maxSec) {
-      const lo = (minSec || 5) * 1000;
-      const hi = (maxSec || 15) * 1000;
-      return Math.floor(Math.random() * (hi - lo + 1)) + lo;
-    },
-
     heatLevel(dailyLimit) {
       if (dailyLimit <= 50)  return { label: 'Safe',     color: '#22c55e', width: '25%' };
       if (dailyLimit <= 100) return { label: 'Moderate', color: '#f59e0b', width: '55%' };
@@ -634,21 +625,6 @@
       labels: ['10', '25', '50', '75', '100', '150', '200', '300', '400'],
       def: 2, // 50
     },
-    'f-minDelay': {
-      values: [2, 3, 5, 7, 10, 15, 20, 30],
-      labels: ['2s', '3s', '5s', '7s', '10s', '15s', '20s', '30s'],
-      def: 2, // 5s
-    },
-    'f-maxDelay': {
-      values: [3, 5, 7, 10, 15, 20, 30, 45, 60],
-      labels: ['3s', '5s', '7s', '10s', '15s', '20s', '30s', '45s', '60s'],
-      def: 4, // 15s
-    },
-    'f-batchSize': {
-      values: [5, 10, 15, 20, 25, 30, 40, 50],
-      labels: ['5', '10', '15', '20', '25', '30', '40', '50'],
-      def: 1, // 10
-    },
     'f-scanLimit': {
       values: [50, 100, 250, 500, 1000, 2000, 5000, 0],
       labels: ['50', '100', '250', '500', '1K', '2K', '5K', 'All'],
@@ -801,9 +777,6 @@
       <div class="xp-section-title">Safety</div>
       ${sl('f-scanLimit',  'Scan limit')}
       ${sl('f-dailyLimit', 'Daily limit')}
-      ${sl('f-minDelay',   'Min delay')}
-      ${sl('f-maxDelay',   'Max delay')}
-      ${sl('f-batchSize',  'Batch size')}
       <div id="xpurge-heat">
         <span id="heat-label">Safe</span>
         <div id="heat-bar-bg"><div id="heat-bar"></div></div>
@@ -959,9 +932,6 @@
       setSlider('f-accountAgeMonths',   f.accountAgeMonths);
       setSlider('f-scanLimit',          f.scanLimit);
       setSlider('f-dailyLimit',         f.dailyLimit);
-      setSlider('f-minDelay',           f.minDelay);
-      setSlider('f-maxDelay',           f.maxDelay);
-      setSlider('f-batchSize',          f.batchSize);
 
       txt('f-bioBlacklist', f.bioBlacklist.join(', '));
       txt('f-bioWhitelist', f.bioWhitelist.join(', '));
@@ -986,9 +956,6 @@
         bioWhitelist:        kws('f-bioWhitelist'),
         scanLimit:           sliderVal('f-scanLimit'),         // 0 = no limit
         dailyLimit:          sliderVal('f-dailyLimit') || 50,
-        minDelay:            sliderVal('f-minDelay')   || 5,
-        maxDelay:            sliderVal('f-maxDelay')   || 15,
-        batchSize:           sliderVal('f-batchSize')  || 10,
       };
     },
 
