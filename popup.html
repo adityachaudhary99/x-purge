@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 240px;
+      background: #0f1117;
+      color: #e7e9ea;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-size: 13px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid #2f3336;
+    }
+    header img { width: 28px; height: 28px; border-radius: 6px; }
+    header h1 { font-size: 15px; font-weight: 700; color: #fff; }
+    header span { font-size: 11px; color: #71767b; }
+
+    .section {
+      padding: 12px 16px;
+      border-bottom: 1px solid #1e2126;
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #71767b;
+    }
+    .stat-row:last-child { margin-bottom: 0; }
+    .stat-val { color: #e7e9ea; font-weight: 600; }
+    .stat-val.red { color: #ef4444; }
+    .stat-val.green { color: #22c55e; }
+
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 9px 12px;
+      border-radius: 20px;
+      border: none;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+      transition: background 0.15s;
+    }
+    .btn-primary { background: #1d9bf0; color: #fff; }
+    .btn-primary:hover { background: #1a8cd8; }
+    .btn-secondary { background: #2f3336; color: #e7e9ea; border: 1px solid #4f5356; }
+    .btn-secondary:hover { background: #3f4347; }
+
+    .actions { padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+
+    .status-dot {
+      display: inline-block;
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      margin-right: 5px;
+    }
+    .dot-on  { background: #22c55e; box-shadow: 0 0 4px #22c55e; }
+    .dot-off { background: #71767b; }
+
+    footer {
+      padding: 8px 16px;
+      font-size: 11px;
+      color: #4f5356;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="icons/icon48.png" alt="X-Purge">
+    <div>
+      <h1>X-Purge</h1>
+      <span>Smart unfollow tool</span>
+    </div>
+  </header>
+
+  <div class="section">
+    <div class="stat-row">
+      <span>Panel status</span>
+      <span class="stat-val" id="panel-status">
+        <span class="status-dot dot-off" id="status-dot"></span>
+        <span id="status-text">Loading…</span>
+      </span>
+    </div>
+    <div class="stat-row">
+      <span>Unfollowed today</span>
+      <span class="stat-val" id="daily-count">—</span>
+    </div>
+    <div class="stat-row">
+      <span>Daily limit</span>
+      <span class="stat-val" id="daily-limit">—</span>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-open">Open Following Page</button>
+    <button class="btn btn-secondary" id="btn-toggle" style="display:none">Toggle Panel</button>
+  </div>
+
+  <footer>Works on x.com/following</footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
