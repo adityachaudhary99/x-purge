@@ -21,8 +21,8 @@ X-Purge is a Chrome extension (Manifest V3) that scans your Following list using
 - **Scan first, act later** — preview every matched account with reason, follower count, account age, and bio before unfollowing anything
 - **Per-account controls** — Skip or Unfollow individual accounts from the results list
 - **Unfollow All** — batch-unfollow everything in the list with a single click
-- **Collapsible panels** — Filters and Results sections are independently togglable
-- **Safety heat meter** — visual Green → Red indicator that warns when daily limit is set aggressively
+- **Split view** — Filters and Results panels share the panel height equally; both are always visible after a scan. Each section can also be independently collapsed with the ▾ toggle
+- **Safety heat meter** — visual Green → Red indicator that warns when daily limit is set aggressively; an inline warning appears when the limit exceeds 200
 - **Daily counter** — resets at midnight; persisted in `chrome.storage.local`
 
 ---
@@ -49,7 +49,7 @@ Manages all persistent state (daily counter, whitelist, filter settings) via `ch
 
 ## Installation
 
-> X-Purge is not on the Chrome Web Store. Load it as an unpacked extension.
+> X-Purge is available on the Chrome Web Store, or you can load it as an unpacked extension.
 
 1. **Clone or download** this repository:
    ```bash
@@ -87,7 +87,7 @@ Manages all persistent state (daily counter, whitelist, filter settings) via `ch
 
 ## Safety
 
-- **Daily cap** defaults to 50 unfollows/day. The heat meter turns orange at 100 and red at 150
+- **Daily cap** defaults to 50 unfollows/day, adjustable up to 2000 or **All** (no cap). The heat meter turns orange above 100 and red above 200; a warning appears at any setting above 200 noting X may rate-limit or restrict the account
 - **Batch pause**: a silent 1–3 second pause fires every 10 unfollows to reduce rate-limit risk
 - **Global whitelist**: accounts added to the whitelist are never unfollowed regardless of any filter
 - **No DOM automation for unfollows**: direct REST API calls (`destroy.json`) are used instead of simulating button clicks, making the flow faster and less detectable
@@ -146,8 +146,9 @@ X-Purge does **not** collect, transmit, or store any of your data externally. Ev
 ### Build the submission package
 
 ```bash
-bash build.sh
-# → creates x-purge-1.1.0.zip
+bash build.sh        # → creates x-purge-<version>.zip
+# Windows:
+.\build.ps1
 ```
 
 ### Store listing checklist

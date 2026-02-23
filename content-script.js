@@ -453,10 +453,11 @@
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
 
     heatLevel(dailyLimit) {
-      if (dailyLimit <= 50)  return { label: 'Safe',     color: '#22c55e', width: '25%' };
-      if (dailyLimit <= 100) return { label: 'Moderate', color: '#f59e0b', width: '55%' };
-      if (dailyLimit <= 150) return { label: 'Elevated', color: '#ef4444', width: '80%' };
-      return                        { label: 'Danger',   color: '#7f1d1d', width: '100%' };
+      if (dailyLimit === 0 || dailyLimit > 500) return { label: 'Danger',   color: '#7f1d1d', width: '100%' };
+      if (dailyLimit <= 50)  return                    { label: 'Safe',     color: '#22c55e', width: '15%' };
+      if (dailyLimit <= 100) return                    { label: 'Moderate', color: '#f59e0b', width: '35%' };
+      if (dailyLimit <= 200) return                    { label: 'Elevated', color: '#ef4444', width: '60%' };
+      return                                           { label: 'Danger',   color: '#7f1d1d', width: '85%' };
     },
   };
 
@@ -562,7 +563,7 @@
         const acc = targets[i];
         const daily = await SW.getDailyCount();
 
-        if (daily >= filters.dailyLimit) {
+        if (filters.dailyLimit > 0 && daily >= filters.dailyLimit) {
           onProgress({ action: `Daily limit (${filters.dailyLimit}) reached`, unfollowed, total: targets.length });
           break;
         }
@@ -621,8 +622,8 @@
       def: 0,
     },
     'f-dailyLimit': {
-      values: [10, 25, 50, 75, 100, 150, 200, 300, 400],
-      labels: ['10', '25', '50', '75', '100', '150', '200', '300', '400'],
+      values: [10, 25, 50, 75, 100, 150, 200, 400, 1000, 2000, 0],
+      labels: ['10', '25', '50', '75', '100', '150', '200', '400', '1K', '2K', 'All'],
       def: 2, // 50
     },
     'f-scanLimit': {
@@ -781,6 +782,9 @@
         <span id="heat-label">Safe</span>
         <div id="heat-bar-bg"><div id="heat-bar"></div></div>
       </div>
+      <div id="daily-warn" style="display:none; margin-top:6px; font-size:11px; color:#f59e0b; line-height:1.4">
+        &#9888; High limits may trigger X rate-limiting or account restrictions.
+      </div>
     </div>
 
     <!-- Whitelist Manager -->
@@ -884,14 +888,8 @@
     },
 
     async _loadSaved() {
-      // chrome.runtime.id goes undefined when the extension is reloaded without
-      // refreshing the tab — detect this early and show a clear message.
-      if (!chrome.runtime?.id) {
-        this._showReloadBanner();
-        return;
-      }
       const saved = await SW.getFilters();
-      if (saved === null) { this._showReloadBanner(); return; } // context died mid-call
+      if (saved === null) return; // context died mid-call
       if (saved) {
         state.filters = { ...state.filters, ...saved };
         this._fillForm(state.filters);
@@ -900,20 +898,6 @@
       state.dailyCount = (await SW.getDailyCount()) ?? 0;
       this._renderWhitelist();
       this._updateHeat();
-    },
-
-    _showReloadBanner() {
-      const prog = document.getElementById('xpurge-progress');
-      const actions = document.getElementById('xpurge-actions');
-      if (prog) {
-        prog.style.display = 'block';
-        const el = document.getElementById('prog-action');
-        if (el) {
-          el.style.color = '#ef4444';
-          el.textContent = '⚠ Extension was reloaded — refresh this page (F5) to reconnect.';
-        }
-      }
-      if (actions) actions.style.display = 'none';
     },
 
     _fillForm(f) {
@@ -955,20 +939,19 @@
         bioBlacklist:        kws('f-bioBlacklist'),
         bioWhitelist:        kws('f-bioWhitelist'),
         scanLimit:           sliderVal('f-scanLimit'),         // 0 = no limit
-        dailyLimit:          sliderVal('f-dailyLimit') || 50,
+        dailyLimit:          sliderVal('f-dailyLimit'),  // 0 = no limit (All)
       };
     },
 
     _updateHeat() {
-      const limit = sliderVal('f-dailyLimit') || 50;
+      const limit = sliderVal('f-dailyLimit');
       const heat = Safety.heatLevel(limit);
       const label = document.getElementById('heat-label');
-      const bar = document.getElementById('heat-bar');
+      const bar   = document.getElementById('heat-bar');
+      const warn  = document.getElementById('daily-warn');
       if (label) label.textContent = heat.label;
-      if (bar) {
-        bar.style.width = heat.width;
-        bar.style.backgroundColor = heat.color;
-      }
+      if (bar) { bar.style.width = heat.width; bar.style.backgroundColor = heat.color; }
+      if (warn) warn.style.display = (limit === 0 || limit > 200) ? 'block' : 'none';
     },
 
     async _renderWhitelist() {
@@ -998,11 +981,6 @@
     // ---- Scan / Purge flow ----
     async _startScan(dryRun) {
       if (state.running || state.scanning) return;
-      if (!chrome.runtime?.id) { this._showReloadBanner(); return; }
-
-      // Restore filter panel (may be hidden from a previous scan's results view)
-      document.getElementById('xpurge-body').style.display = 'block';
-      document.getElementById('filters-chevron')?.classList.add('open');
 
       state.filters = this._readForm();
 
@@ -1202,18 +1180,17 @@
       const countLabel  = document.getElementById('result-count-label');
       const unfAllBtn   = document.getElementById('btn-unfollow-all');
       wrap.style.display = 'block';
-      document.getElementById('xpurge-body').style.display = 'none';
       document.getElementById('result-list').style.display = 'block';
-      // Sync chevrons: filters closed, results open
-      document.getElementById('filters-chevron')?.classList.remove('open');
       document.getElementById('results-chevron')?.classList.add('open');
 
       const updateHeader = () => {
         countLabel.textContent = `${state.targets.length} accounts match filters`;
         if (state.targets.length > 0) {
-          const remaining    = Math.max(0, state.filters.dailyLimit - state.dailyCount);
-          const willUnfollow = Math.min(state.targets.length, remaining);
-          unfAllBtn.textContent = `Unfollow All (${willUnfollow} under daily limit)`;
+          const willUnfollow = state.filters.dailyLimit === 0
+            ? state.targets.length
+            : Math.min(state.targets.length, Math.max(0, state.filters.dailyLimit - state.dailyCount));
+          const limitNote = state.filters.dailyLimit === 0 ? 'no daily limit' : `${willUnfollow} under daily limit`;
+          unfAllBtn.textContent = `Unfollow All (${limitNote})`;
           unfAllBtn.style.display = 'block';
         } else {
           unfAllBtn.style.display = 'none';
@@ -1263,7 +1240,7 @@
             btn.disabled = true;
             btn.textContent = '…';
             const daily = await SW.getDailyCount();
-            if (daily >= state.filters.dailyLimit) { btn.textContent = 'Limit!'; return; }
+            if (state.filters.dailyLimit > 0 && daily >= state.filters.dailyLimit) { btn.textContent = 'Limit!'; return; }
             state.running = true;
             const ok = await Engine.unfollowOne(acc);
             state.running = false;
