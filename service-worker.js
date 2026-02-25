@@ -1,11 +1,13 @@
 // X-Purge Service Worker (MV3)
-// Manages persistent state: daily counters, whitelist, settings.
+// Manages persistent state: daily counters, whitelist, settings, scan cache.
 
 const STORAGE_KEYS = {
-  DAILY_COUNT: 'dailyCount',
-  DAILY_DATE: 'dailyDate',
-  WHITELIST: 'whitelist',
-  FILTERS: 'filters',
+  DAILY_COUNT:           'dailyCount',
+  DAILY_DATE:            'dailyDate',
+  WHITELIST:             'whitelist',
+  FILTERS:               'filters',
+  SCAN_CACHE_FOLLOWING:  'scanCache_following',
+  SCAN_CACHE_FOLLOWERS:  'scanCache_followers',
 };
 
 // ============================================================
@@ -56,6 +58,30 @@ async function removeFromWhitelist(username) {
 }
 
 // ============================================================
+// Scan cache — stores the full account list from last scan
+// per mode (following / followers) so re-filtering doesn't
+// require a new API scan.
+// ============================================================
+function _cacheKey(mode) {
+  return mode === 'followers' ? STORAGE_KEYS.SCAN_CACHE_FOLLOWERS : STORAGE_KEYS.SCAN_CACHE_FOLLOWING;
+}
+
+async function getScanCache(mode) {
+  const key = _cacheKey(mode);
+  const data = await chrome.storage.local.get(key);
+  return data[key] || null;
+}
+
+async function setScanCache(mode, accounts, scannedAt) {
+  const key = _cacheKey(mode);
+  await chrome.storage.local.set({ [key]: { accounts, scannedAt } });
+}
+
+async function clearScanCache(mode) {
+  await chrome.storage.local.remove(_cacheKey(mode));
+}
+
+// ============================================================
 // Message handler from content script
 // ============================================================
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -90,6 +116,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       chrome.storage.local.set({ [STORAGE_KEYS.FILTERS]: msg.filters }).then(() => {
         sendResponse({ ok: true });
       });
+      return true;
+
+    case 'GET_SCAN_CACHE':
+      getScanCache(msg.mode).then(sendResponse);
+      return true;
+
+    case 'SET_SCAN_CACHE':
+      setScanCache(msg.mode, msg.accounts, msg.scannedAt).then(() => sendResponse({ ok: true }));
+      return true;
+
+    case 'CLEAR_SCAN_CACHE':
+      clearScanCache(msg.mode).then(() => sendResponse({ ok: true }));
       return true;
 
     default:

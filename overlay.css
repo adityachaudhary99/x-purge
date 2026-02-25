@@ -275,8 +275,9 @@ input[type="checkbox"] {
 /* ── Action buttons ── */
 #xpurge-actions {
   display: flex;
+  align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 10px;
   padding: 10px 14px;
   border-top: 1px solid #1e2126;
   flex-shrink: 0;
@@ -472,3 +473,63 @@ input[type="checkbox"] {
 #xpurge-results::-webkit-scrollbar-track { background: transparent; }
 #xpurge-body::-webkit-scrollbar-thumb,
 #xpurge-results::-webkit-scrollbar-thumb { background: #2f3336; border-radius: 2px; }
+
+/* ── Resizer drag handle between Filters and Results ── */
+#xp-resizer {
+  height: 6px;
+  cursor: ns-resize;
+  background: #1e2126;
+  flex-shrink: 0;
+  display: none;
+  position: relative;
+  transition: background 0.15s;
+}
+#xp-resizer:hover,
+#xp-resizer.dragging { background: #1d9bf0; }
+#xp-resizer::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 28px;
+  height: 2px;
+  background: #4f5356;
+  border-radius: 1px;
+}
+
+/* ── Mode badge (Following / Followers) in panel header ── */
+#xp-mode-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: #1d9bf0;
+  color: #fff;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+#xp-mode-badge.followers { background: #9333ea; }
+
+/* ── Cache info inline with scan button ── */
+#xp-cache-info {
+  display: none;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #71767b;
+}
+#xp-cache-time { white-space: nowrap; }
+#btn-rescan {
+  background: none;
+  border: 1px solid #2f3336;
+  border-radius: 6px;
+  color: #71767b;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+}
+#btn-rescan:hover { border-color: #1d9bf0; color: #1d9bf0; }

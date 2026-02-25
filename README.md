@@ -1,12 +1,18 @@
 # ⚡ X-Purge
 
-**Smart X (Twitter) unfollow tool — no API key, no subscription, runs entirely in your browser.**
+**Smart X (Twitter) follower/following manager — no API key, no subscription, runs entirely in your browser.**
 
-X-Purge is a Chrome extension (Manifest V3) that scans your Following list using X's own internal GraphQL API and lets you bulk-unfollow accounts based on a rich set of filters. It operates directly on `x.com/following` — no external servers, no data collection, no $200/mo API plan.
+X-Purge is a Chrome extension (Manifest V3) that scans your **Following** and **Followers** lists using X's own internal APIs and lets you bulk-manage accounts based on a rich set of filters. It operates directly on `x.com` — no external servers, no data collection, no $200/mo API plan.
 
 ---
 
 ## Features
+
+### Modes
+| Mode | What it does |
+|------|-------------|
+| **Following** | Scan accounts you follow — unfollow in bulk |
+| **Followers** | Scan accounts that follow you — remove followers in bulk |
 
 ### Filters
 | Category | Filter |
@@ -15,7 +21,7 @@ X-Purge is a Chrome extension (Manifest V3) that scans your Following list using
 | **Activity** | Inactive for more than N days (detects never-tweeted accounts too) |
 | **Profile Quality** | Default avatar ("egg") · Exclude verified · Follower/following ratio below X · Protect accounts with ≥ N followers · Account age below N months |
 | **Keywords** | Bio blacklist (e.g. `crypto, nft, bot`) · Bio whitelist (e.g. `founder, vc`) |
-| **Safety** | Daily unfollow cap · Scan limit · Global whitelist (never unfollow specific accounts) |
+| **Safety** | Daily remove cap · Scan limit · Global whitelist (never touch specific accounts) |
 
 ### UX
 - **Scan first, act later** — preview every matched account with reason, follower count, account age, and bio before unfollowing anything
@@ -34,16 +40,31 @@ X-Purge uses two content scripts running in different execution worlds:
 ### `page-bridge.js` — MAIN world, `document_start`
 Patches the page's native `fetch`, `XMLHttpRequest`, and `Headers` prototypes before X's own JS loads:
 - **`Headers.prototype.set/append`** — intercepts X's `Authorization: Bearer …` header the moment X's code creates it
-- **`XMLHttpRequest.prototype.open`** — captures the GraphQL `queryId`, `userId`, and `features` from the organic `Following` request URL
-- Assembles full API credentials (`queryId + userId + bearer + features`) and relays them to the isolated world via `window.postMessage`
+- **`XMLHttpRequest.prototype.open`** — captures the GraphQL `queryId`, `userId`, and `features` from organic Following/Followers request URLs
+- Intercepts native Followers XHR responses and relays them to the isolated world as a pre-scan cache (seeds the scan before the user clicks Scan)
+- Assembles full API credentials and relays them to the isolated world via `window.postMessage`
 
 ### `content-script.js` — ISOLATED world, `document_idle`
-- Receives credentials from the bridge and uses them to call `GET /i/api/graphql/{queryId}/Following` directly, paginating 200 accounts at a time — **no DOM scrolling required**
-- Unfollows via `POST /i/api/1.1/friendships/destroy.json` (just needs Bearer token + `ct0` CSRF cookie)
-- Falls back to DOM scrolling + button clicking if credentials haven't been captured yet
+**Following mode:**
+- Calls `GET /i/api/graphql/{queryId}/Following` directly, paginating 200 accounts at a time — no DOM scrolling required
+- Unfollows via `POST /i/api/1.1/friendships/destroy.json`
+
+**Followers mode:**
+- Primary: calls `GET /i/api/1.1/followers/list.json` directly — 200 accounts per page, no special anti-bot headers required
+- Removes followers via `POST /i/api/graphql/{queryId}/RemoveFollower` (block+unblock fallback if GQL unavailable)
+- Fallback: DOM scroll + XHR interception if the REST API is unavailable
 
 ### `service-worker.js`
 Manages all persistent state (daily counter, whitelist, filter settings) via `chrome.storage.local`. The daily counter auto-resets at midnight.
+
+---
+
+## Known Limitations
+
+### Followers GraphQL endpoint (404 / Cloudflare WAF)
+The `GET /i/api/graphql/{queryId}/Followers` endpoint is protected by Cloudflare WAF and requires an `x-client-transaction-id` header — a time-based, single-use token computed client-side by X's JavaScript using a private key baked into their bundle. We cannot generate or reuse this token, so direct GraphQL calls to the Followers endpoint will always 404.
+
+**Current mitigation:** the extension uses the REST v1.1 `followers/list.json` endpoint as primary (which does not require the token) and falls back to scroll-triggered XHR interception if needed. Both paths work correctly in practice.
 
 ---
 
@@ -68,7 +89,7 @@ Manages all persistent state (daily counter, whitelist, filter settings) via `ch
 
 ## Usage
 
-1. Navigate to **`x.com/following`** — the panel appears automatically in the top-right corner
+1. Navigate to **`x.com/following`** or **`x.com/{username}/followers`** — the panel appears automatically
 
 2. **Configure filters** in the Filters section (all filters are off by default)
 
