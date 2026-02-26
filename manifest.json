@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "X-Purge",
   "version": "1.3.0",
-  "description": "Clean your X following list with smart filters — inactivity, not following back, bots, keywords. No API key needed.",
+  "description": "Manage your X following and followers with smart filters — inactivity, not following back, bots, keywords. No API key needed.",
   "minimum_chrome_version": "111",
   "icons": {
     "16": "icons/icon16.png",
